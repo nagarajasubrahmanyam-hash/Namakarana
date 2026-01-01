@@ -17,11 +17,8 @@ const app = {
         // B. Date/Time Defaults (Now)
         const now = new Date();
         const dateStr = now.toISOString().split('T')[0];
-        const timeStr = [
-            now.getHours().toString().padStart(2, '0'),
-            now.getMinutes().toString().padStart(2, '0'),
-            now.getSeconds().toString().padStart(2, '0')
-        ].join(':');
+        // Correctly handle local time string 
+        const timeStr = now.toTimeString().split(' ')[0].substring(0, 5); // HH:MM
 
         if (document.getElementById('m_dob')) document.getElementById('m_dob').value = dateStr;
         if (document.getElementById('m_tob')) document.getElementById('m_tob').value = timeStr;
@@ -82,6 +79,125 @@ const app = {
         activeBtns.forEach(btn => {
             if(btn.getAttribute('onclick').includes(tabName)) btn.classList.add('active');
         });
+    },
+
+    // --- TIMEZONE LOGIC (The Correct Way) ---
+    tz: {
+        // 1. Get Timezone ID from Lat/Lon (Using free API)
+        fetchZone: async function(lat, lon) {
+            try {
+                // Using timeapi.io (free, no key required)
+                const res = await fetch(`https://timeapi.io/api/TimeZone/coordinate?latitude=${lat}&longitude=${lon}`);
+                const data = await res.json();
+                return data.timeZone; // Returns e.g., "America/New_York"
+            } catch (e) {
+                console.warn("Timezone API failed, falling back to browser default", e);
+                return Intl.DateTimeFormat().resolvedOptions().timeZone;
+            }
+        },
+
+        // 2. Calculate offset for a specific historical date
+        getOffset: function(timeZone, dateObj) {
+            try {
+                // Create a date string in the Target Zone and UTC
+                // We use 'en-US' to ensure consistent format for parsing
+                const strTarget = dateObj.toLocaleString('en-US', { timeZone: timeZone });
+                const strUTC = dateObj.toLocaleString('en-US', { timeZone: 'UTC' });
+
+                // Create Date objects from those strings
+                const dateTarget = new Date(strTarget);
+                const dateUTC = new Date(strUTC);
+
+                // Calculate difference in hours
+                const diffMs = dateTarget.getTime() - dateUTC.getTime();
+                return diffMs / (1000 * 60 * 60);
+            } catch (e) {
+                console.error("Offset calculation error", e);
+                return 0;
+            }
+        },
+
+        // 3. Update the UI
+        updateUI: async function(pfx, lat, lon) {
+            const statusEl = document.getElementById(`${pfx}_tz_status`);
+            if(statusEl) statusEl.innerText = "⏳ Fetching Timezone...";
+
+            // A. Get Zone Name
+            const zoneId = await this.fetchZone(lat, lon);
+            
+            // B. Get Date of Birth
+            const dobRaw = document.getElementById(`${pfx}_dob`).value;
+            const tobRaw = document.getElementById(`${pfx}_tob`).value || "12:00";
+            const dateObj = new Date(`${dobRaw}T${tobRaw}`);
+
+            // C. Calculate Historical Offset
+            const offset = this.getOffset(zoneId, dateObj);
+
+            // D. Set Dropdown
+            const sel = document.getElementById(`${pfx}_tz`);
+            
+            // Add option if it doesn't exist (e.g., -4.5)
+            let exists = Array.from(sel.options).some(opt => parseFloat(opt.value) === offset);
+            if (!exists) {
+                // Create new option: "America/New_York (UTC -4)"
+                const label = `${zoneId} (UTC ${offset >= 0 ? '+' : ''}${offset})`;
+                const newOpt = new Option(label, offset);
+                
+                // Add to top of list
+                sel.add(newOpt, 0);
+                sel.value = offset;
+            } else {
+                sel.value = offset;
+            }
+
+            // Visual Confirmation
+            if(statusEl) {
+                statusEl.innerHTML = `✅ <strong>${zoneId}</strong> detected.<br>Offset on birth date: <strong>UTC ${offset >= 0 ? '+' : ''}${offset}</strong>`;
+                statusEl.style.color = "var(--success)";
+            }
+        }
+    },
+
+    // --- UI HANDLERS ---
+    ui: {
+        handleSearchDebounced: function(pfx) { 
+            clearTimeout(app.searchTimeout); 
+            app.searchTimeout = setTimeout(() => this.handleSearch(pfx), 400); 
+        },
+        
+        handleSearch: async function(pfx) { 
+            const q = document.getElementById(`${pfx}_city`).value; 
+            if (q.length < 3) return;
+            
+            const box = document.getElementById(`${pfx}_city_results`);
+            box.innerText = "Searching...";
+            box.style.display = 'block';
+
+            try {
+                // Using Nominatim for City Search
+                const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${q}&limit=5`);
+                const data = await res.json();
+                
+                box.innerHTML = data.map(c => `
+                    <div class="search-item" onclick="app.ui.pickCity('${pfx}', ${c.lat}, ${c.lon}, '${c.display_name.replace(/'/g, "")}')">
+                        ${c.display_name.split(',').slice(0,2).join(',')}
+                    </div>`).join('');
+            } catch(e) { 
+                console.error("Search failed", e);
+                box.innerText = "Error fetching cities.";
+            }
+        },
+
+        pickCity: function(pfx, lat, lon, name) { 
+            // 1. Set City Data
+            document.getElementById(`${pfx}_lat`).value = lat; 
+            document.getElementById(`${pfx}_lon`).value = lon; 
+            document.getElementById(`${pfx}_city`).value = name; 
+            document.getElementById(`${pfx}_city_results`).style.display = 'none'; 
+            
+            // 2. TRIGGER TIMEZONE DETECTION (The Core Logic)
+            app.tz.updateUI(pfx, lat, lon);
+        }
     },
 
     // --- 2. MAIN CALCULATION ENGINE (NAMING TOOL) ---
@@ -629,33 +745,6 @@ const app = {
             navigator.geolocation.getCurrentPosition((pos) => { 
                 this.ui.pickCity(pfx, pos.coords.latitude, pos.coords.longitude, "My Location"); 
             });
-        }
-    },
-
-    ui: {
-        handleSearchDebounced: function(pfx) { 
-            clearTimeout(app.searchTimeout); 
-            app.searchTimeout = setTimeout(() => this.handleSearch(pfx), 400); 
-        },
-        handleSearch: async function(pfx) { 
-            const q = document.getElementById(`${pfx}_city`).value; 
-            if (q.length < 3) return;
-            try {
-                const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${q}&limit=5`);
-                const data = await res.json();
-                const box = document.getElementById(`${pfx}_city_results`);
-                box.innerHTML = data.map(c => `
-                    <div class="search-item" onclick="app.ui.pickCity('${pfx}', ${c.lat}, ${c.lon}, '${c.display_name.split(',')[0]}')">
-                        ${c.display_name}
-                    </div>`).join('');
-                box.style.display = 'block';
-            } catch(e) { console.error("Search failed", e); }
-        },
-        pickCity: function(pfx, lat, lon, name) { 
-            document.getElementById(`${pfx}_lat`).value = lat; 
-            document.getElementById(`${pfx}_lon`).value = lon; 
-            document.getElementById(`${pfx}_city`).value = name; 
-            document.getElementById(`${pfx}_city_results`).style.display = 'none'; 
         }
     }
 };
